@@ -1,42 +1,40 @@
 #!/usr/bin/env python3
 """KV-cache retention pressure benchmark (deployment-agnostic).
 
-Quantifies how much context a vLLM prefix cache actually retains under
-overflow pressure — independent of the advertised "GPU KV cache size"
-number, which is an active-request planning budget, not a ceiling on
-cacheable content. Works against any OpenAI-compatible endpoint.
+Quantifies how much context a prefix cache actually retains under overflow
+pressure — independent of the advertised capacity number, which is an
+active-request planning budget, not a ceiling on cacheable content. Works
+against any OpenAI-compatible endpoint.
 
 Procedure:
-  1. capacity  - the engine's advertised KV size in tokens. Either passed
-                 with --kv-size, or auto-read from the engine's log over
-                 ssh (--ssh-host, greps "GPU KV cache size").
-  2. calibrate - one probe request to measure real tokens/char for this
-                 tokenizer (length-dependent; iterates until convergence).
-  3. phase A   - hydrate N unique ~39K-token contexts sequentially,
+  1. capacity  - the engine's advertised KV size in tokens, passed with
+                 --kv-size (required).
+  2. calibrate - tokens/char probe (length-dependent; iterates to
+                 convergence), then a threshold calibration: one probe
+                 context sent cold (miss baseline) and again from cache
+                 (hit baseline); the verify threshold is their midpoint.
+  3. phase A   - hydrate N unique ~8K-token contexts sequentially,
                  max_tokens 1 each (prefill-only; the full context is
                  committed regardless of output length). Default
-                 N = ceil(capacity/40000)+5 so the cache overflows.
+                 N = ceil(capacity/8000)+5 so the cache overflows.
   4. phase B   - re-send each context in reverse order (newest first),
-                 max_tokens 1, classify hit/miss by TTFT. The first miss
-                 (going back in time) is the oldest evicted context = the
-                 real retained capacity under pressure. The verify loop
-                 stops at that first miss: under LRU everything older is
-                 evicted by construction, so those probes are skipped.
+                 max_tokens 1, classify hit/miss by TTFT against the
+                 calibrated threshold. The first miss (going back in time)
+                 is the oldest evicted context = the real retained capacity
+                 under pressure. The verify loop stops at that first miss:
+                 under LRU everything older is evicted by construction.
 
   --compare A.json B.json diffs two result files (e.g. fixed vs control
   image) for a before/after verdict.
 
 Run:
   python3 cache_pressure.py --kv-size 2000000 --output run.json
-  python3 cache_pressure.py --ssh-host mynode --output run.json   # auto-read capacity
   python3 cache_pressure.py --compare fix.json control.json
 """
 import argparse
 import json
 import math
 import random
-import re
-import subprocess
 import sys
 import time
 
@@ -56,34 +54,88 @@ LOREM = (
 )
 
 DEFAULT_URL = "http://localhost:8000/v1"
-DEFAULT_MODEL = "deepseek-v4-flash"
-DEFAULT_LOG = "~/vllm.log"
-DEFAULT_CONTEXT_TOKENS = 39000
+DEFAULT_CONTEXT_TOKENS = 8000
 DEFAULT_MARGIN = 5
-DEFAULT_HIT_THRESHOLD = 3.0
+DEFAULT_HIT_THRESHOLD = 1.5
 PROBE_CHARS = 2000
 
 
-def fetch_kv_size(host, log=DEFAULT_LOG):
-    """Return (kv_size_tokens, concurrency) parsed from the engine log.
+def resolve_model(base_url, api_key=None, timeout=10, get_fn=None):
+    """Auto-detect the served model via GET /models (OpenAI-compatible).
 
-    Requires ssh access to the node running the engine and a
-    "GPU KV cache size" line in its log. Returns (None, None) when the
-    log line is missing or ssh fails.
+    Returns the model id, or None when detection fails (endpoint missing,
+    error, or empty list). Picks the first served model when several are
+    available, with a note to pass --model to disambiguate.
     """
+    if get_fn is None:
+        def get_fn(url, headers=None, timeout=10):
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            return resp.json()
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    url = base_url.rstrip("/") + "/models"
     try:
-        remote = f'grep -E "GPU KV cache size|Maximum concurrency" {log}'
-        out = subprocess.run(
-            ["ssh", host, remote],
-            capture_output=True, text=True, timeout=20,
-        ).stdout
+        data = get_fn(url, headers=headers, timeout=timeout)
     except Exception:
-        return None, None
-    size = re.search(r"GPU KV cache size:\s*([0-9,]+)", out)
-    conc = re.search(r"Maximum concurrency.*:\s*([0-9.]+)x", out)
-    kv = int(size.group(1).replace(",", "")) if size else None
-    c = float(conc.group(1)) if conc else None
-    return kv, c
+        return None
+    seen = set()
+    ids = []
+    if isinstance(data, list):
+        items = data
+    else:
+        items = data.get("data") or data.get("models") or []
+    for m in items:
+        mid = m.get("id") or m.get("model")
+        if mid and mid not in seen:
+            seen.add(mid)
+            ids.append(mid)
+    if not ids:
+        return None
+    if len(ids) > 1:
+        print(f"  Multiple models served ({', '.join(ids)}); using {ids[0]} "
+              "(pass --model to disambiguate)")
+    return ids[0]
+
+
+def calibrate_threshold(base_url, model, api_key, timeout, context_tokens,
+                        tokens_per_char, request_fn=None):
+    """Measure cold-prefill and cache-hit TTFT at the real context size.
+
+    Sends one unique probe context twice: the first send is a cold prefill
+    (miss baseline), the second is served from the prefix cache (hit
+    baseline). Returns (threshold, cold_ttft, hit_ttft) where threshold is
+    their midpoint — a separator that stays valid regardless of engine
+    speed — or (None, ...) when calibration is unreliable.
+
+    The probe context uses a run-unique salt so it can never collide with a
+    prefix a previous run left cached: a deterministic probe would be
+    served from that leftover and read as a fake "hit" on its first send.
+    """
+    if request_fn is None:
+        request_fn = do_request
+    url = base_url.rstrip("/") + "/chat/completions"
+    salt = random.randrange(100000, 1000000)
+    msgs = build_messages(make_body(int(context_tokens / tokens_per_char),
+                                    salt=salt))
+    cold_ttft, _e2e, _out, _prompt, err1 = request_fn(
+        url, model, msgs, 1, timeout, api_key)
+    hit_ttft, _e2e, _out, _prompt, err2 = request_fn(
+        url, model, msgs, 1, timeout, api_key)
+    if err1 or err2:
+        print(f"  Threshold calibration failed: probe error "
+              f"(cold={err1 or '–'}, hit={err2 or '–'})")
+        return None, None, None
+    if not cold_ttft or not hit_ttft:
+        print("  Threshold calibration failed: no token received on a probe")
+        return None, None, None
+    if hit_ttft >= cold_ttft:
+        print(f"  Threshold calibration failed: hit ({hit_ttft:.3f}s) not "
+              f"faster than cold ({cold_ttft:.3f}s) — engine not caching, "
+              f"or the probe collided with cached content")
+        return None, cold_ttft, hit_ttft
+    return (cold_ttft + hit_ttft) / 2.0, cold_ttft, hit_ttft
 
 
 def make_body(chars, salt=0):
@@ -145,7 +197,9 @@ def do_request(url, model, messages, max_tokens, timeout, api_key=None):
             chunk = json.loads(data)
             choices = chunk.get("choices", [])
             delta = choices[0].get("delta", {}) if choices else {}
-            tok = delta.get("content", "") or delta.get("reasoning", "")
+            tok = (delta.get("content", "")
+                   or delta.get("reasoning", "")
+                   or delta.get("reasoning_content", ""))
             if tok:
                 if first:
                     ttft = time.monotonic() - t0
@@ -209,12 +263,13 @@ def hydrate_phase(url, model, contexts, max_tokens, timeout, api_key, capacity):
         ttft, e2e, out, prompt, err = do_request(
             url, model, build_messages(ctx), max_tokens, timeout, api_key)
         pref = (prompt / ttft) if ttft > 0 and prompt else None
+        pref_s = f"{pref:5.0f}tok/s" if pref is not None else "     –"
         rows.append({"index": i, "ttft": ttft, "e2e": e2e, "output_tokens": out,
                      "prompt_tokens": prompt, "error": err})
         used += prompt or 0
         print(f"  [{i + 1}/{len(contexts)}] hydrate  ttft={ttft:7.2f}s  "
               f"e2e={e2e:7.2f}s  prompt={prompt or '?':>6}  out={out:>4}  "
-              f"prefill={pref:5.0f}tok/s  err={err or '–'}  {fmt_progress(used, capacity)}")
+              f"prefill={pref_s}  err={err or '–'}  {fmt_progress(used, capacity)}")
     return rows
 
 
@@ -272,21 +327,20 @@ def summarise(capacity, contexts, verify_rows, threshold):
 
 def run_pressure(args):
     url = args.base_url.rstrip("/") + "/chat/completions"
+    capacity = args.kv_size
 
-    capacity, concurrency = (args.kv_size, None)
-    if capacity is None and args.ssh_host:
-        capacity, concurrency = fetch_kv_size(args.ssh_host, args.log)
-        if capacity is not None:
-            print(f"  KV size from {args.ssh_host}: {capacity:,} tokens"
-                  + (f"  (concurrency {concurrency}x @500K)" if concurrency else ""))
-    if capacity is None:
-        print("  Could not determine KV size (pass --kv-size, or --ssh-host "
-              "for log-based auto-read).")
-        sys.exit(1)
+    model = args.model
+    if model is None:
+        model = resolve_model(args.base_url, args.api_key, args.timeout)
+        if model is None:
+            print("  Could not auto-detect a model (GET /models failed or "
+                  "returned none); pass --model")
+            sys.exit(1)
+        print(f"  Model: {model} (auto-detected)")
 
     tokens_per_char = args.tokens_per_char
     if not args.skip_calibrate:
-        tpc, conv_chars = calibrate(args.base_url, args.model, args.api_key,
+        tpc, conv_chars = calibrate(args.base_url, model, args.api_key,
                                     args.timeout, args.context_tokens)
         if tpc is not None:
             tokens_per_char = tpc
@@ -295,6 +349,20 @@ def run_pressure(args):
         else:
             print(f"  Calibration failed; falling back to {tokens_per_char} "
                   f"chars/token (contexts will be mis-sized)")
+
+    threshold = args.hit_threshold
+    cold_ttft = hit_ttft = None
+    if threshold is None:
+        threshold, cold_ttft, hit_ttft = calibrate_threshold(
+            args.base_url, model, args.api_key, args.timeout,
+            args.context_tokens, tokens_per_char)
+        if threshold is None:
+            threshold = DEFAULT_HIT_THRESHOLD
+            print(f"  Threshold calibration failed; using fallback "
+                  f"{threshold:.1f}s")
+        else:
+            print(f"  Threshold calibrated: cold={cold_ttft:.2f}s  "
+                  f"hit={hit_ttft:.2f}s  ->  {threshold:.2f}s")
 
     budget = args.context_tokens + args.max_tokens_hydrate
     n = args.num_contexts
@@ -306,7 +374,7 @@ def run_pressure(args):
 
     contexts = generate_contexts(n, args.context_tokens, tokens_per_char)
     print(f"── Phase A: hydrate {n} contexts (max_tokens={args.max_tokens_hydrate}) ──")
-    hydrate = hydrate_phase(url, args.model, contexts,
+    hydrate = hydrate_phase(url, model, contexts,
                             args.max_tokens_hydrate, args.timeout, args.api_key,
                             capacity)
     actual_total = sum((r.get("prompt_tokens") or 0) + (r.get("output_tokens") or 0)
@@ -318,13 +386,13 @@ def run_pressure(args):
               "measure retention under pressure (bump --num-contexts).")
     print()
     print(f"── Phase B: verify in reverse order (max_tokens={args.max_tokens_verify}, "
-          f"hit < {args.hit_threshold}s) ──")
-    verify = verify_phase(url, args.model, contexts,
+          f"hit < {threshold:.2f}s) ──")
+    verify = verify_phase(url, model, contexts,
                           args.max_tokens_verify, args.timeout, args.api_key,
-                          args.hit_threshold, capacity)
+                          threshold, capacity)
     print()
 
-    summary = summarise(capacity, contexts, verify, args.hit_threshold)
+    summary = summarise(capacity, contexts, verify, threshold)
     print("── Retention under pressure ──")
     print(f"  capacity:            {capacity:,} tokens")
     print(f"  retained contexts:   {summary['retained']}/{n}")
@@ -338,12 +406,14 @@ def run_pressure(args):
 
     result = {
         "capacity_tokens": capacity,
-        "concurrency": concurrency,
+        "model": model,
         "context_tokens_target": args.context_tokens,
         "budget_per_context": budget,
         "num_contexts": n,
         "tokens_per_char": tokens_per_char,
-        "threshold": args.hit_threshold,
+        "threshold": threshold,
+        "cold_ttft": cold_ttft,
+        "hit_ttft": hit_ttft,
         "hydrate": hydrate,
         "verify": verify,
         "retained": summary["retained"],
@@ -383,18 +453,14 @@ def compare(a_path, b_path):
               f"{a['retained_pct'] - b['retained_pct']:+,.2f} pp")
 
 
-def main():
+def main(argv=None):
     p = argparse.ArgumentParser(description="KV-cache retention pressure benchmark")
     p.add_argument("--base-url", default=DEFAULT_URL)
-    p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument("--model", default=None,
+                   help="Model id (default: auto-detected via GET /models)")
     p.add_argument("--api-key", default=None)
-    p.add_argument("--ssh-host", default=None,
-                   help="Read capacity from the engine log over ssh "
-                        "(optional; otherwise --kv-size is required)")
-    p.add_argument("--log", default=DEFAULT_LOG,
-                   help="Engine log path on the ssh host")
     p.add_argument("--kv-size", type=int, default=None,
-                   help="KV cache size in tokens (default: parsed from log via ssh)")
+                   help="Advertised KV cache size in tokens (required)")
     p.add_argument("--context-tokens", type=int, default=DEFAULT_CONTEXT_TOKENS)
     p.add_argument("--tokens-per-char", type=float, default=0.25,
                    help="Fallback tokens/char when calibration is skipped/fails")
@@ -404,16 +470,20 @@ def main():
     p.add_argument("--margin", type=int, default=DEFAULT_MARGIN)
     p.add_argument("--max-tokens-hydrate", type=int, default=1)
     p.add_argument("--max-tokens-verify", type=int, default=1)
-    p.add_argument("--hit-threshold", type=float, default=DEFAULT_HIT_THRESHOLD)
+    p.add_argument("--hit-threshold", type=float, default=None,
+                   help="TTFT threshold in seconds for hit/miss (default: "
+                        "calibrated midpoint between cold prefill and cache hit)")
     p.add_argument("--timeout", type=int, default=300)
     p.add_argument("--output", default=None)
     p.add_argument("--compare", nargs=2, metavar=("FIX_JSON", "CONTROL_JSON"),
                    help="Diff two result files instead of running")
-    args = p.parse_args()
+    args = p.parse_args(argv)
 
     if args.compare:
         compare(*args.compare)
         return
+    if args.kv_size is None:
+        p.error("the following arguments are required: --kv-size")
     run_pressure(args)
 
 

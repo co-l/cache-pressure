@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Needle-in-haystack retrieval validation for the DS4 prod engine.
+"""Needle-in-haystack retrieval validation (deployment-agnostic).
 
 Sweeps increasing context lengths, each with a unique haystack and a single
 needle sentence deep in the text (default 0.8 depth). The model must
 retrieve the exact secret code — end-to-end proof that long-context
 attention/KV is intact on the live engine. Haystacks are unique per run
-(random salt), so no prefix-cache hit can mask a broken prefill.
+(random salt), so no prefix-cache hit can mask a broken prefill. Works
+against any OpenAI-compatible endpoint.
 
 Run:
   python3 needle_test.py                      # 50K/100K/200K/300K/450K
@@ -21,10 +22,9 @@ from pathlib import Path
 
 import requests
 
-from cache_pressure import calibrate, make_body
+from cache_pressure import calibrate, make_body, resolve_model
 
 DEFAULT_URL = "http://localhost:8000/v1"
-DEFAULT_MODEL = "deepseek-v4-flash"
 DEFAULT_LENGTHS = [50000, 100000, 200000, 300000, 450000]
 NEEDLE_WORDS = ["plover", "zirconium", "octopus", "thimble", "wombat", "kestrel"]
 QUESTION = (
@@ -129,7 +129,8 @@ def run_length(url, model, target, tpc, salt, pos, max_tokens, timeout,
 def main():
     p = argparse.ArgumentParser(description="Needle-in-haystack retrieval validation")
     p.add_argument("--base-url", default=DEFAULT_URL)
-    p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument("--model", default=None,
+                   help="Model id (default: auto-detected via GET /models)")
     p.add_argument("--api-key", default=None)
     p.add_argument("--lengths", default=",".join(str(x) for x in DEFAULT_LENGTHS),
                    help="Comma-separated context lengths in tokens")
@@ -149,12 +150,20 @@ def main():
     lengths = [int(x) for x in args.lengths.split(",") if x.strip()]
     salt = args.salt if args.salt is not None else int(time.time())
     url = args.base_url.rstrip("/") + "/chat/completions"
-    rng = random.Random(salt)
+
+    model = args.model
+    if model is None:
+        model = resolve_model(args.base_url, args.api_key, args.timeout)
+        if model is None:
+            print("  Could not auto-detect a model (GET /models failed or "
+                  "returned none); pass --model")
+            sys.exit(1)
+        print(f"  Model: {model} (auto-detected)")
 
     max_len = max(lengths)
     tpc = args.tokens_per_char
     if tpc is None:
-        tpc, _ = calibrate(args.base_url, args.model, args.api_key,
+        tpc, _ = calibrate(args.base_url, model, args.api_key,
                            args.timeout, max_len)
         if tpc is None:
             print("  Calibration failed — pass --tokens-per-char")
@@ -168,7 +177,7 @@ def main():
           f"salt {salt})")
     results = []
     for target in sorted(lengths):
-        results.append(run_length(url, args.model, target, tpc,
+        results.append(run_length(url, model, target, tpc,
                                   salt + target, args.needle_pos,
                                   args.max_tokens, args.timeout,
                                   args.api_key, args.thinking))
