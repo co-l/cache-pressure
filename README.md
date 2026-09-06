@@ -49,7 +49,7 @@ pip install -r requirements.txt
 # point --base-url at your OpenAI-compatible endpoint; the model is
 # auto-detected via GET /models (pass --model to override)
 python3 bench/cache_pressure.py --base-url http://my-server:8000/v1 \
-    --kv-size 2000000 --output run.json
+    --kv-size <ADVERTISED_KV_CACHE> --output run.json
 
 # A/B two runs
 python3 bench/cache_pressure.py --compare fix.json control.json
@@ -59,7 +59,7 @@ Small sanity check (3 contexts, all hits):
 
 ```bash
 python3 bench/cache_pressure.py --base-url http://my-server:8000/v1 \
-    --kv-size 2000000 --num-contexts 3
+    --kv-size <ADVERTISED_KV_CACHE> --num-contexts 3
 ```
 
 ### `needle_test.py` — companion correctness check
