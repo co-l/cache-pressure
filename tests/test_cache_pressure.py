@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the cache-pressure benchmark (cache_pressure).
+"""Tests for the cache-pressure benchmark (cache_pressure.core).
 
 Verifies:
   - verify_phase stops after the first MISS: the reverse-order verify walks
@@ -10,14 +10,15 @@ Verifies:
   - calibrate_threshold derives the hit/miss threshold from measured
     cold-prefill and cache-hit TTFT.
 
-Run:  python3 tests/test_cache_pressure.py
+Run:  uv run python tests/test_cache_pressure.py
 """
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "bench"))
-from cache_pressure import (calibrate_threshold, do_request, hydrate_phase,
-                            resolve_model, summarise, verify_phase)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+import cache_pressure.core as cache_pressure
+from cache_pressure.core import (calibrate_threshold, do_request, hydrate_phase,
+                                 resolve_model, summarise, verify_phase)
 
 FAILURES = []
 
@@ -150,7 +151,6 @@ def test_calibrate_threshold_uses_fresh_probe():
 
 def test_kv_size_required():
     try:
-        import cache_pressure
         cache_pressure.main(["--num-contexts", "3"])
         check("--kv-size required (argparse exit 2)", False)
     except SystemExit as e:
@@ -170,7 +170,6 @@ class FakeStream:
 
 
 def test_do_request_counts_reasoning_content_for_ttft():
-    import cache_pressure
     lines = [
         b'data: {"choices":[{"delta":{"role":"assistant"}}]}',
         b'data: {"choices":[{"delta":{"reasoning_content":" thinking"}}]}',
@@ -195,7 +194,6 @@ def test_hydrate_phase_survives_zero_ttft():
     import contextlib
     import io
 
-    import cache_pressure
     orig = cache_pressure.do_request
     cache_pressure.do_request = lambda *a, **k: (0.0, 0.0, 0, 8000, None)
     buf = io.StringIO()

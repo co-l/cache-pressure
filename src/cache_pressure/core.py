@@ -28,8 +28,8 @@ Procedure:
   image) for a before/after verdict.
 
 Run:
-  python3 cache_pressure.py --kv-size 2000000 --output run.json
-  python3 cache_pressure.py --compare fix.json control.json
+  uvx cache-pressure --kv-size 2000000 --output run.json
+  uvx cache-pressure --compare fix.json control.json
 """
 import argparse
 import json

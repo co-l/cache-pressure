@@ -9,9 +9,9 @@ attention/KV is intact on the live engine. Haystacks are unique per run
 against any OpenAI-compatible endpoint.
 
 Run:
-  python3 needle_test.py                      # 50K/100K/200K/300K/450K
-  python3 needle_test.py --lengths 50000,100000
-  python3 needle_test.py --thinking           # let it reason (slower)
+  uvx --from cache-pressure needle-test         # 50K/100K/200K/300K/450K
+  uvx --from cache-pressure needle-test --lengths 50000,100000
+  uvx --from cache-pressure needle-test --thinking   # let it reason (slower)
 """
 import argparse
 import json
@@ -22,7 +22,7 @@ from pathlib import Path
 
 import requests
 
-from cache_pressure import calibrate, make_body, resolve_model
+from cache_pressure.core import calibrate, make_body, resolve_model
 
 DEFAULT_URL = "http://localhost:8000/v1"
 DEFAULT_LENGTHS = [50000, 100000, 200000, 300000, 450000]
@@ -42,7 +42,7 @@ def chat_stream(url, model, messages, max_tokens, timeout, api_key=None, thinkin
         "stream": True,
         "stream_options": {"include_usage": True},
     }
-    if thinking is not None:
+    if thinking:
         payload["chat_template_kwargs"] = {"thinking": thinking}
     headers = {"Content-Type": "application/json"}
     if api_key:
