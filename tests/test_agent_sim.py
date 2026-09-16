@@ -127,6 +127,23 @@ def test_summarise():
           out2["finalize_ok"] == 0)
 
 
+def test_summarise_excludes_aborted():
+    recs = [
+        _records(0, "main", 0, 5000, 0, 0.0),
+        dict(_records(0, "main", 1, 10000, 0, 0.01), aborted=True),
+        _records(0, "main", 2, 15000, 14800, 0.99),
+        dict(_records(0, "sub", 0, 40000, 0, 0.0), aborted=True),
+        _records(0, "finalize", 0, 17000, 15000, 0.99),
+    ]
+    out = summarise(recs, num_sessions=1, sub_windows=2, threshold=0.95)
+    check("aborted main continuation excluded from the miss count",
+          out["main_total"] == 1 and out["main_reused"] == 1)
+    check("aborted sub excluded from the cold count",
+          out["subs_total"] == 0 and out["subs_cold"] == 0)
+    check("completed finalize kept", out["finalize_total"] == 1 and
+          out["finalize_ok"] == 1)
+
+
 def _hit(prompt=1000):
     return {"prompt": prompt, "cached": prompt, "cached_source": "usage",
             "ttft": 0.01, "wall": 0.01, "content": "ok", "error": None}
@@ -138,8 +155,13 @@ def _miss(prompt=1000):
 
 
 def _run_session_with_fake(fake, plan, thinking=False, stop_event=None):
-    """Drive run_session against a fake chat_stream; return (calls, records)."""
+    """Drive run_session against a fake chat_stream.
+
+    Returns (calls, records, kwargs): the message lists, the recorded
+    records, and the extra kwargs (e.g. abort_event) each call received.
+    """
     calls = []
+    kwargs = []
 
     def _default(url, model, messages, max_tokens, timeout, api_key,
                  thinking_flag):
@@ -148,8 +170,9 @@ def _run_session_with_fake(fake, plan, thinking=False, stop_event=None):
     impl = _default if fake is None else fake
 
     def wrapped(url, model, messages, max_tokens, timeout, api_key,
-                thinking_flag):
+                thinking_flag, **kw):
         calls.append(list(messages))
+        kwargs.append(kw)
         return impl(url, model, messages, max_tokens, timeout, api_key,
                     thinking_flag)
 
@@ -167,7 +190,7 @@ def _run_session_with_fake(fake, plan, thinking=False, stop_event=None):
                               lock=threading.Lock(), stop_event=stop_event)
     finally:
         agent_sim.chat_stream = orig
-    return calls, records
+    return calls, records, kwargs
 
 
 def _user_count(messages):
@@ -177,7 +200,7 @@ def _user_count(messages):
 def test_run_session_finalize_prefix():
     plan = build_session_plan(salt=7, step_tokens=5000, steps=2,
                               sub_tokens=40000, sub_windows=1, finalize_new=2000)
-    calls, records = _run_session_with_fake(None, plan)
+    calls, records, _kw = _run_session_with_fake(None, plan)
     system = {"role": "system", "content": SYSTEM}
     u0 = {"role": "user", "content": plan["main"][0]}
     u1 = {"role": "user", "content": plan["main"][1]}
@@ -201,7 +224,8 @@ def test_run_session_finalize_prefix():
 def test_run_session_thinking_flag():
     seen = []
 
-    def fake(url, model, messages, max_tokens, timeout, api_key, thinking_flag):
+    def fake(url, model, messages, max_tokens, timeout, api_key, thinking_flag,
+             **kw):
         seen.append(thinking_flag)
         return _hit()
     plan = build_session_plan(salt=7, step_tokens=5000, steps=2,
@@ -221,7 +245,7 @@ def test_run_session_aborts_on_main_miss():
     def fake(url, model, messages, max_tokens, timeout, api_key, thinking_flag):
         return _miss() if _user_count(messages) == 3 else _hit()
     stop = threading.Event()
-    calls, records = _run_session_with_fake(fake, plan, stop_event=stop)
+    calls, records, _kw = _run_session_with_fake(fake, plan, stop_event=stop)
     check("main continuation miss trips the stop event", stop.is_set())
     check("no requests issued after the miss", len(calls) == 3, f"{len(calls)}")
     check("only executed turns recorded", len(records) == 3, f"{len(records)}")
@@ -235,7 +259,7 @@ def test_run_session_aborts_on_finalize_miss():
     def fake(url, model, messages, max_tokens, timeout, api_key, thinking_flag):
         return _miss() if _user_count(messages) == 3 else _hit()
     stop = threading.Event()
-    calls, records = _run_session_with_fake(fake, plan, stop_event=stop)
+    calls, records, _kw = _run_session_with_fake(fake, plan, stop_event=stop)
     check("finalize miss trips the stop event", stop.is_set())
     check("finalize is the last turn", len(calls) == 4, f"{len(calls)}")
 
@@ -245,7 +269,7 @@ def test_run_session_hit_run_never_aborts():
     plan = build_session_plan(salt=7, step_tokens=5000, steps=3,
                               sub_tokens=40000, sub_windows=1,
                               finalize_new=2000)
-    calls, records = _run_session_with_fake(None, plan, stop_event=stop)
+    calls, records, _kw = _run_session_with_fake(None, plan, stop_event=stop)
     check("hit run does not trip the stop event", not stop.is_set())
     check("hit run completes all turns", len(calls) == 5, f"{len(calls)}")
     check("hit run records every turn", len(records) == 5, f"{len(records)}")
@@ -257,7 +281,7 @@ def test_run_session_skips_when_stop_already_set():
     plan = build_session_plan(salt=7, step_tokens=5000, steps=2,
                               sub_tokens=40000, sub_windows=1,
                               finalize_new=2000)
-    calls, records = _run_session_with_fake(None, plan, stop_event=stop)
+    calls, records, _kw = _run_session_with_fake(None, plan, stop_event=stop)
     check("no turns run when already stopped",
           len(calls) == 0 and len(records) == 0,
           f"calls={len(calls)} records={len(records)}")
@@ -275,10 +299,42 @@ def test_run_session_shared_stop_halts_other_session():
     _run_session_with_fake(miss_on_main2, plan, stop_event=stop)
     check("first session tripped the stop event", stop.is_set())
 
-    calls, records = _run_session_with_fake(None, plan, stop_event=stop)
+    calls, records, _kw = _run_session_with_fake(None, plan, stop_event=stop)
     check("second session issued no turns once stopped",
           len(calls) == 0 and len(records) == 0,
           f"calls={len(calls)} records={len(records)}")
+
+
+def test_run_session_forwards_abort_event():
+    stop = threading.Event()
+    plan = build_session_plan(salt=7, step_tokens=5000, steps=2,
+                              sub_tokens=40000, sub_windows=1,
+                              finalize_new=2000)
+    calls, _records, kwargs = _run_session_with_fake(None, plan,
+                                                     stop_event=stop)
+    check("abort_event forwarded on every turn",
+          len(kwargs) == 4
+          and all(kw.get("abort_event") is stop for kw in kwargs),
+          f"{len(kwargs)} calls")
+
+
+def test_run_session_aborted_turn():
+    plan = build_session_plan(salt=7, step_tokens=5000, steps=3,
+                              sub_tokens=40000, sub_windows=1,
+                              finalize_new=2000)
+    stop = threading.Event()
+
+    def fake(url, model, messages, max_tokens, timeout, api_key,
+             thinking_flag):
+        return {**_hit(), "aborted": True} if _user_count(messages) == 2 \
+            else _hit()
+    calls, records, _kw = _run_session_with_fake(fake, plan, stop_event=stop)
+    check("aborted turn recorded with the flag",
+          len(records) == 2 and records[1]["aborted"] is True,
+          f"{len(records)} records")
+    check("no further turns after the abort", len(calls) == 2,
+          f"{len(calls)}")
+    check("aborted turn stops the run", stop.is_set())
 
 
 # ── live progress view ─────────────────────────────────────────────────
@@ -342,6 +398,17 @@ def test_fmt_record():
     check("_fmt_record err + reuse_class + None shown",
           line2 == ("  s2 main      step  7  prompt=       –  "
                     "cached=       –  reuse= 99.5%  hit  ttft=0.42s  err=boom"))
+
+
+def test_fmt_record_aborted():
+    rec = {"session": 2, "phase": "main", "step": 7,
+           "prompt": None, "cached": None, "cached_source": "none",
+           "reuse": 0.0, "ttft": 0.42, "wall": 1.2, "error": None,
+           "aborted": True}
+    line = _fmt_record(rec)
+    check("_fmt_record aborted marker",
+          line == ("  s2 main      step  7  prompt=       –  "
+                   "cached=       –  reuse=  0.0%  ttft=0.42s  err=–  ABORTED"))
 
 
 def test_render_frame_side_by_side():
@@ -492,6 +559,68 @@ def test_chat_stream_completion_tokens():
     check("streaming response closed", FakeResp.closed == 1)
 
 
+def test_chat_stream_aborts_pre_post():
+    abort = threading.Event()
+    abort.set()
+    posted = []
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def close(self):
+            pass
+
+        def iter_lines(self):
+            return iter([])
+
+    orig_post = agent_sim.requests.post
+    agent_sim.requests.post = lambda *a, **k: posted.append(1) or FakeResp()
+    try:
+        res = agent_sim.chat_stream("http://x/v1/chat/completions", "m",
+                                    [{"role": "user", "content": "hi"}], 64,
+                                    5, None, False, abort_event=abort)
+    finally:
+        agent_sim.requests.post = orig_post
+    check("no request posted when abort pre-set", not posted)
+    check("aborted flag set", res["aborted"] is True)
+    check("nothing captured", res["prompt"] is None
+          and res["cached"] is None and res["content"] == "")
+
+
+def test_chat_stream_aborts_mid_stream():
+    abort = threading.Event()
+
+    class FakeResp:
+        closed = 0
+
+        def raise_for_status(self):
+            pass
+
+        def close(self):
+            type(self).closed += 1
+
+        def iter_lines(self):
+            yield b"data: " + json.dumps(
+                {"choices": [{"delta": {"content": "hel"}}]}).encode()
+            abort.set()
+            yield b"data: " + json.dumps(
+                {"choices": [{"delta": {"content": "lo!"}}]}).encode()
+
+    orig_post = agent_sim.requests.post
+    agent_sim.requests.post = lambda *a, **k: FakeResp()
+    try:
+        res = agent_sim.chat_stream("http://x/v1/chat/completions", "m",
+                                    [{"role": "user", "content": "hi"}], 64,
+                                    5, None, False, abort_event=abort)
+    finally:
+        agent_sim.requests.post = orig_post
+    check("aborted mid-stream", res["aborted"] is True)
+    check("only pre-abort content captured", res["content"] == "hel")
+    check("no usage seen", res["prompt"] is None and res["cached"] is None)
+    check("connection closed on abort", FakeResp.closed == 1)
+
+
 def test_viz_enabled():
     check("default: only on a tty", viz_enabled(True) and not viz_enabled(False))
     check("force wins over piped stdout", viz_enabled(False, force=True))
@@ -513,16 +642,22 @@ def main():
     test_run_session_hit_run_never_aborts()
     test_run_session_skips_when_stop_already_set()
     test_run_session_shared_stop_halts_other_session()
+    test_run_session_forwards_abort_event()
+    test_run_session_aborted_turn()
     test_viz_enabled()
     test_bar()
     test_formats()
     test_fmt_record()
+    test_fmt_record_aborted()
     test_render_frame_side_by_side()
     test_render_frame_stacked()
     test_render_frame_done_and_err()
     test_render_frame_color()
     test_live_view()
     test_chat_stream_completion_tokens()
+    test_chat_stream_aborts_pre_post()
+    test_chat_stream_aborts_mid_stream()
+    test_summarise_excludes_aborted()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILURE(S): {FAILURES}")

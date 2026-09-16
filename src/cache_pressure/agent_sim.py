@@ -119,11 +119,15 @@ def read_prefix_cache_metrics(base_url, api_key, timeout):
 
 
 def chat_stream(url, model, messages, max_tokens, timeout, api_key, thinking,
-                on_delta=None):
+                on_delta=None, abort_event=None):
     """Stream one completion; return prompt/cached/ttft/wall/content/error.
 
     on_delta, when given, is called with the char count of each content
-    chunk as it arrives (drives the live progress view).
+    chunk as it arrives (drives the live progress view). abort_event, when
+    given, is polled before posting and on every streamed line: once set,
+    the connection is closed and the partial result is returned with
+    aborted=True — a cache miss in one session cuts short the pending
+    requests of every other session instead of letting them finish.
     """
     payload = {
         "model": model,
@@ -145,43 +149,50 @@ def chat_stream(url, model, messages, max_tokens, timeout, api_key, thinking,
     content = ""
     error = None
     resp = None
+    aborted = False
     try:
-        resp = requests.post(url, json=payload, headers=headers, stream=True,
-                             timeout=timeout)
-        resp.raise_for_status()
-        for line in resp.iter_lines():
-            if not line:
-                continue
-            line = line.decode().strip()
-            if not line.startswith("data: "):
-                continue
-            data = line[6:]
-            if data == "[DONE]":
-                break
-            chunk = json.loads(data)
-            usage = chunk.get("usage")
-            if usage:
-                prompt = usage.get("prompt_tokens", prompt)
-                cached_usage = ((usage.get("prompt_tokens_details") or {})
-                                .get("cached_tokens"))
-                completion = usage.get("completion_tokens", completion)
-            timings = chunk.get("timings")
-            if timings:
-                cached_timings = timings.get("cache_n")
-            choices = chunk.get("choices") or []
-            if choices:
-                delta = choices[0].get("delta", {})
-                tok = (delta.get("content")
-                       or delta.get("reasoning")
-                       or delta.get("reasoning_content") or "")
-                if tok:
-                    if ttft is None:
-                        ttft = time.monotonic() - t0
-                    c = delta.get("content")
-                    if c:
-                        content += c
-                        if on_delta:
-                            on_delta(len(c))
+        if abort_event is not None and abort_event.is_set():
+            aborted = True
+        else:
+            resp = requests.post(url, json=payload, headers=headers,
+                                 stream=True, timeout=timeout)
+            resp.raise_for_status()
+            for line in resp.iter_lines():
+                if abort_event is not None and abort_event.is_set():
+                    aborted = True
+                    break
+                if not line:
+                    continue
+                line = line.decode().strip()
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:]
+                if data == "[DONE]":
+                    break
+                chunk = json.loads(data)
+                usage = chunk.get("usage")
+                if usage:
+                    prompt = usage.get("prompt_tokens", prompt)
+                    cached_usage = ((usage.get("prompt_tokens_details") or {})
+                                    .get("cached_tokens"))
+                    completion = usage.get("completion_tokens", completion)
+                timings = chunk.get("timings")
+                if timings:
+                    cached_timings = timings.get("cache_n")
+                choices = chunk.get("choices") or []
+                if choices:
+                    delta = choices[0].get("delta", {})
+                    tok = (delta.get("content")
+                           or delta.get("reasoning")
+                           or delta.get("reasoning_content") or "")
+                    if tok:
+                        if ttft is None:
+                            ttft = time.monotonic() - t0
+                        c = delta.get("content")
+                        if c:
+                            content += c
+                            if on_delta:
+                                on_delta(len(c))
     except Exception as exc:  # noqa: BLE001
         error = str(exc)
         if ttft is None:
@@ -204,6 +215,7 @@ def chat_stream(url, model, messages, max_tokens, timeout, api_key, thinking,
         "content": content,
         "completion": completion,
         "error": error,
+        "aborted": aborted,
     }
 
 
@@ -214,8 +226,10 @@ def run_session(base_url, model, api_key, timeout, plan, session_id,
 
     Fails fast: the first turn that should hit the cache (a main continuation,
     step > 0, or the finalize) that comes back with reuse < miss_threshold
-    trips the shared stop_event. Every session then winds down, so only the
-    turns that actually ran are recorded.
+    trips the shared stop_event. Every session then winds down, and turns
+    still in flight are aborted at the next streamed chunk (the stop_event
+    doubles as chat_stream's abort_event), so only the turns that actually
+    ran are recorded.
     """
     if stop_event is None:
         stop_event = threading.Event()
@@ -235,7 +249,7 @@ def run_session(base_url, model, api_key, timeout, plan, session_id,
             viz.turn_start(sid, phase, step, user_chars)
         extra = {"on_delta": (lambda c: viz.delta(sid, c))} if viz else {}
         res = chat_stream(url, model, messages, max_tokens, timeout,
-                          api_key, thinking, **extra)
+                          api_key, thinking, abort_event=stop_event, **extra)
         return res
 
     def _abort():
@@ -249,12 +263,13 @@ def run_session(base_url, model, api_key, timeout, plan, session_id,
         main_messages.append({"role": "user", "content": chunk})
         res = _send(main_messages, "main", step, len(chunk))
         reuse = compute_reuse(res["cached"], prev_prompt)
+        aborted = bool(res.get("aborted"))
         record = {"session": session_id, "phase": "main", "step": step,
                   "prompt": res["prompt"],
                   "cached": res["cached"], "cached_source": res["cached_source"],
                   "reuse": reuse,
                   "ttft": res["ttft"], "wall": res["wall"],
-                  "error": res["error"]}
+                  "error": res["error"], "aborted": aborted}
         with lock:
             records.append(record)
         if viz is None:
@@ -263,8 +278,13 @@ def run_session(base_url, model, api_key, timeout, plan, session_id,
             viz.turn_end(sid, res, reuse)
         if res["prompt"]:
             prev_prompt = res["prompt"]
-        main_messages.append({"role": "assistant",
-                              "content": res["content"] or FALLBACK_REPLY})
+        if not aborted:
+            main_messages.append({"role": "assistant",
+                                  "content": res["content"] or FALLBACK_REPLY})
+        if aborted:
+            stop_event.set()
+            _abort()
+            break
         if step > 0 and not res["error"] and reuse < miss_threshold:
             stop_event.set()
             _abort()
@@ -283,35 +303,41 @@ def run_session(base_url, model, api_key, timeout, plan, session_id,
                       "cached": res["cached"], "cached_source": res["cached_source"],
                       "reuse": 0.0,
                       "ttft": res["ttft"], "wall": res["wall"],
-                      "error": res["error"]}
+                      "error": res["error"],
+                      "aborted": bool(res.get("aborted"))}
             with lock:
                 records.append(record)
             if viz is None:
                 print(_fmt_record(record), flush=True)
             if viz:
                 viz.turn_end(sid, res, 0.0)
+            if res.get("aborted"):
+                stop_event.set()
+                _abort()
+                break
 
     if not stop_event.is_set():
         main_messages.append({"role": "user", "content": plan["finalize"]})
         res = _send(main_messages, "finalize", 0, len(plan["finalize"]))
         reuse = compute_reuse(res["cached"], prev_prompt)
+        aborted = bool(res.get("aborted"))
         record = {"session": session_id, "phase": "finalize", "step": 0,
                   "prompt": res["prompt"],
                   "cached": res["cached"], "cached_source": res["cached_source"],
                   "reuse": reuse,
                   "ttft": res["ttft"], "wall": res["wall"],
-                  "error": res["error"]}
+                  "error": res["error"], "aborted": aborted}
         with lock:
             records.append(record)
         if viz is None:
             print(_fmt_record(record), flush=True)
         if viz:
             viz.turn_end(sid, res, reuse)
-        miss = not res["error"] and reuse < miss_threshold
-        if miss:
+        miss = not res["error"] and not aborted and reuse < miss_threshold
+        if miss or aborted:
             stop_event.set()
         if viz:
-            viz.finish(sid, not miss)
+            viz.finish(sid, not miss and not aborted)
     session.close()
 
 
@@ -611,10 +637,16 @@ class Viz:
 
 def summarise(records, num_sessions, sub_windows, threshold=0.95,
               elapsed=None):
-    """Headline metrics from the collected per-turn records."""
-    mains = [r for r in records if r["phase"] == "main" and r["step"] > 0]
-    finals = [r for r in records if r["phase"] == "finalize"]
-    subs = [r for r in records if r["phase"] == "sub"]
+    """Headline metrics from the collected per-turn records.
+
+    Turns aborted mid-flight (another session tripped the stop) are left out
+    — they neither hit nor missed, so they would only skew the counts.
+    """
+    mains = [r for r in records if r["phase"] == "main" and r["step"] > 0
+             and not r.get("aborted")]
+    finals = [r for r in records if r["phase"] == "finalize"
+              and not r.get("aborted")]
+    subs = [r for r in records if r["phase"] == "sub" and not r.get("aborted")]
     main_reused = sum(1 for r in mains if r["reuse"] >= threshold)
     finalize_ok = sum(1 for r in finals if r["reuse"] >= threshold)
     subs_cold = sum(1 for r in subs
@@ -645,11 +677,12 @@ def _fmt_record(r):
     shown = "–" if cached is None else f"{cached:,}"
     reuse_class = r.get("reuse_class", "")
     prompt_shown = "–" if r["prompt"] is None else f"{r['prompt']:,}"
+    aborted = "  ABORTED" if r.get("aborted") else ""
     return (f"  s{r['session']} {r['phase']:<9} step {r['step']:>2}  "
             f"prompt={prompt_shown:>8}  cached={shown:>8}  "
             f"reuse={r['reuse'] * 100:5.1f}%  "
             f"{reuse_class + '  ' if reuse_class else ''}"
-            f"ttft={_fmt(r['ttft'])}  err={r['error'] or '–'}")
+            f"ttft={_fmt(r['ttft'])}  err={r['error'] or '–'}{aborted}")
 
 
 def main(argv=None):
