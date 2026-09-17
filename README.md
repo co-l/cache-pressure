@@ -19,8 +19,9 @@ deployment.
 | `needle-test` | whether long-context retrieval is intact | `uvx --from cache-pressure needle-test --base-url …` |
 | `agent-sim` | session retention under concurrent load | `uvx --from cache-pressure agent-sim --base-url …` |
 | `abort-sim` | prefix survival after a mid-thinking abort | `uvx --from cache-pressure abort-sim --base-url …` |
+| `perf-sim` | prefill/generation speed vs context length | `uvx --from cache-pressure perf-sim --base-url …` |
 
-All four talk to the same OpenAI-compatible endpoint (`--base-url`, default
+All five talk to the same OpenAI-compatible endpoint (`--base-url`, default
 `http://localhost:8000/v1`), auto-detect the model via `GET /models`
 (override with `--model`), and take `--api-key` when the endpoint requires it.
 
@@ -217,18 +218,55 @@ Key flags: `--context-tokens` (40000), `--thinking-tokens` (500), `--runs`
 (2), `--min-reuse` (0.95), `--reprompt-mode` (branch), `--timeout` (600),
 `--salt`, `--ninfer-log`.
 
+### `perf-sim` — speed vs context length
+
+A performance benchmark, not a retention one: it grows a single context
+from 0 toward the model's max context in full `--step-tokens` increments
+(default 10k tokens of true lorem ipsum) and measures prefill (`pp`) and
+generation (`tg`) throughput at every context level. Each step generates a
+fixed `--output-tokens` budget (default 256) and replays the reply into
+the next request, so the prefix is stable — responses included — the same
+organic growth `agent-sim` simulates, but sequential (concurrency 1) and
+timed.
+
+Per step, the tool reports:
+
+- `pp` — incremental prefill speed `(prompt − cached) / ttft`: the first
+  step is a full cold prefill, later steps prefill only the new increment,
+  so the curve is prefill speed at each context level;
+- `tg` — generation speed `completion / (wall − ttft)`.
+
+```bash
+uvx --from cache-pressure perf-sim --base-url http://my-server:8000/v1 --output run.json
+
+# deterministic A/B (same salt = identical planned inputs)
+uvx --from cache-pressure perf-sim --base-url http://my-server:8000/v1 --salt 42
+```
+
+Key flags: `--step-tokens` (10000), `--output-tokens` (256),
+`--runs` (3), `--max-context` (auto from `GET /models` `max_model_len`),
+`--timeout` (1200), `--salt`, `--thinking`. The step count is the number
+of full increments that fit under the max context (replies count toward
+the growth), so the last step lands just short of the limit — no partial
+increment. Each `--runs` pass replays the same planned chunks with a
+fresh conversation; the summary's per-level `context`/`pp`/`tg` arrays
+average the runs, which smooths out single-shot timing noise. `--output`
+writes the per-step records (with a `run` index) plus those arrays. The
+exit code is 0 only if every step of every run completed.
+
 ## Development
 
 ```bash
 git clone <repo> && cd cache-pressure
 uv sync                        # create .venv with the project installed
 
-# unit tests, no cluster needed (run all five before calling anything done)
+# unit tests, no cluster needed (run all six before calling anything done)
 uv run python tests/test_cache_pressure.py
 uv run python tests/test_needle.py
 uv run python tests/test_ninfer_log.py
 uv run python tests/test_agent_sim.py
 uv run python tests/test_abort_sim.py
+uv run python tests/test_perf_sim.py
 
 # exercise the console scripts against the local checkout
 # (uv run, not uvx — uvx may re-run a stale cached wheel)
@@ -236,6 +274,7 @@ uv run cache-pressure --help
 uv run needle-test --help
 uv run agent-sim --help
 uv run abort-sim --help
+uv run perf-sim --help
 ```
 
 ## Interpreting results

@@ -15,14 +15,16 @@ Rules and gotchas for AI agents working in this repo.
 ## Tests
 
 - Plain pytest-less python files: `uv run python tests/test_x.py`
-  (each exits non-zero on failure). Run all five before calling anything done:
+  (each exits non-zero on failure). Run all six before calling anything done:
   `test_cache_pressure.py`, `test_needle.py`, `test_ninfer_log.py`,
-  `test_agent_sim.py`, `test_abort_sim.py`.
+  `test_agent_sim.py`, `test_abort_sim.py`, `test_perf_sim.py`.
 - **TDD**: when fixing or refactoring, write/update the failing test first,
   then make it pass.
 - `agent_sim.py` unit tests must stay network-free: `chat_stream` and
   `run_session` are faked via monkeypatching / keyword args (see
   `_run_session_with_fake`).
+- `perf_sim.py` unit tests stay network-free too: `run_perf` is driven
+  against a faked `chat_stream` (same monkeypatch pattern).
 - For live-endpoint smoke tests, a stub SSE server in `/tmp/agent_sim_stub.py`
   (longest-prefix-match fake cache) + `script -qec "..." /dev/null` gives a
   pty so the live progress view actually renders. Check for ANSI frames with
@@ -51,6 +53,8 @@ Rules and gotchas for AI agents working in this repo.
 - No code comments in new code unless asked.
 - `make_body(chars, salt=...)` is the deterministic context generator —
   ~4 chars/token target, `chars = int(tokens / 0.25)`.
+- `make_lorem(chars, seed=...)` (perf-sim) is the true-lorem-ipsum variant:
+  same 4 chars/token contract, seeded sentence order (unique per step).
 - Per-turn record dict shape is a contract: tests, `summarise`, the
   `--output` JSON, and `ninfer_log.reannotate_records` all depend on it.
   Extend, don't rename.
