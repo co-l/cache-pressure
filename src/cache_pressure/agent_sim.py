@@ -221,7 +221,7 @@ def chat_stream(url, model, messages, max_tokens, timeout, api_key, thinking,
 
 def run_session(base_url, model, api_key, timeout, plan, session_id,
                 barrier, max_tokens, thinking, records, lock, viz=None,
-                stop_event=None, miss_threshold=0.95):
+                stop_event=None, miss_threshold=0.66):
     """One session worker: grow main -> subs -> finalize, recording each turn.
 
     Fails fast: the first turn that should hit the cache (a main continuation,
@@ -635,7 +635,7 @@ class Viz:
             self._paint(self._render())
 
 
-def summarise(records, num_sessions, sub_windows, threshold=0.95,
+def summarise(records, num_sessions, sub_windows, threshold=0.66,
               elapsed=None):
     """Headline metrics from the collected per-turn records.
 
@@ -694,6 +694,9 @@ def main(argv=None):
     p.add_argument("--api-key", default=None)
     p.add_argument("--sessions", type=int, default=3,
                    help="number of parallel agent sessions")
+    p.add_argument("--miss-threshold", type=float, default=0.66,
+                   help="min reuse fraction a main/finalize turn must hit "
+                        "to avoid aborting the run (default: 0.66)")
     p.add_argument("--main-tokens", type=int, default=150000,
                    help="main-agent context size in tokens")
     p.add_argument("--sub-tokens", type=int, default=40000,
@@ -800,6 +803,7 @@ def main(argv=None):
             "barrier": barrier, "max_tokens": args.max_tokens,
             "thinking": args.thinking, "records": records, "lock": lock,
             "viz": view, "stop_event": stop_event,
+            "miss_threshold": args.miss_threshold,
         })
         threads.append(t)
         t.start()
@@ -833,7 +837,7 @@ def main(argv=None):
         print(_fmt_record(r))
 
     summary = summarise(records, args.sessions, args.sub_windows,
-                        elapsed=elapsed)
+                        threshold=args.miss_threshold, elapsed=elapsed)
     print("\n── summary ──")
     print(f"  run time: {fmt_elapsed(summary['elapsed'])}")
     print(f"  main continuation turns reused: "

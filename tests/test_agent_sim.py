@@ -126,6 +126,15 @@ def test_summarise():
     check("degraded run reported", out2["main_reused"] == 0 and
           out2["finalize_ok"] == 0)
 
+    out66 = summarise([_records(0, "main", 1, 10000, 8000, 0.8)],
+                      num_sessions=1, sub_windows=2, threshold=0.66)
+    check("80% reuse counts as reused at the 66% threshold",
+          out66["main_reused"] == 1 and out66["main_total"] == 1)
+    out95 = summarise([_records(0, "main", 1, 10000, 8000, 0.8)],
+                      num_sessions=1, sub_windows=2, threshold=0.95)
+    check("80% reuse is a miss at the 95% threshold",
+          out95["main_reused"] == 0 and out95["main_total"] == 1)
+
 
 def test_summarise_excludes_aborted():
     recs = [
@@ -154,7 +163,14 @@ def _miss(prompt=1000):
             "ttft": 0.01, "wall": 0.01, "content": "ok", "error": None}
 
 
-def _run_session_with_fake(fake, plan, thinking=False, stop_event=None):
+def _partial(prompt=1000, reuse=0.8):
+    return {"prompt": prompt, "cached": int(prompt * reuse),
+            "cached_source": "usage",
+            "ttft": 0.01, "wall": 0.01, "content": "ok", "error": None}
+
+
+def _run_session_with_fake(fake, plan, thinking=False, stop_event=None,
+                           miss_threshold=None):
     """Drive run_session against a fake chat_stream.
 
     Returns (calls, records, kwargs): the message lists, the recorded
@@ -183,11 +199,14 @@ def _run_session_with_fake(fake, plan, thinking=False, stop_event=None):
         plan = plan or build_session_plan(salt=7, step_tokens=5000, steps=2,
                                           sub_tokens=40000, sub_windows=1,
                                           finalize_new=2000)
-        agent_sim.run_session(base_url="http://x/v1", model="m", api_key=None,
-                              timeout=5, plan=plan, session_id=0,
-                              barrier=threading.Barrier(1), max_tokens=8,
-                              thinking=thinking, records=records,
-                              lock=threading.Lock(), stop_event=stop_event)
+        run_kwargs = {"base_url": "http://x/v1", "model": "m", "api_key": None,
+                      "timeout": 5, "plan": plan, "session_id": 0,
+                      "barrier": threading.Barrier(1), "max_tokens": 8,
+                      "thinking": thinking, "records": records,
+                      "lock": threading.Lock(), "stop_event": stop_event}
+        if miss_threshold is not None:
+            run_kwargs["miss_threshold"] = miss_threshold
+        agent_sim.run_session(**run_kwargs)
     finally:
         agent_sim.chat_stream = orig
     return calls, records, kwargs
@@ -262,6 +281,34 @@ def test_run_session_aborts_on_finalize_miss():
     calls, records, _kw = _run_session_with_fake(fake, plan, stop_event=stop)
     check("finalize miss trips the stop event", stop.is_set())
     check("finalize is the last turn", len(calls) == 4, f"{len(calls)}")
+
+
+def test_run_session_lower_threshold_tolerates_partial_reuse():
+    plan = build_session_plan(salt=7, step_tokens=5000, steps=3,
+                              sub_tokens=40000, sub_windows=1,
+                              finalize_new=2000)
+
+    def fake(url, model, messages, max_tokens, timeout, api_key, thinking_flag):
+        return _partial() if _user_count(messages) == 3 else _hit()
+    stop = threading.Event()
+    calls, records, _kw = _run_session_with_fake(fake, plan, stop_event=stop)
+    check("partial reuse below the 66% default is tolerated",
+          not stop.is_set())
+    check("run completes all turns", len(calls) == 5, f"{len(calls)}")
+
+
+def test_run_session_strict_threshold_aborts_on_partial_reuse():
+    plan = build_session_plan(salt=7, step_tokens=5000, steps=3,
+                              sub_tokens=40000, sub_windows=1,
+                              finalize_new=2000)
+
+    def fake(url, model, messages, max_tokens, timeout, api_key, thinking_flag):
+        return _partial() if _user_count(messages) == 3 else _hit()
+    stop = threading.Event()
+    calls, records, _kw = _run_session_with_fake(fake, plan, stop_event=stop,
+                                                 miss_threshold=0.95)
+    check("same partial reuse trips a strict threshold", stop.is_set())
+    check("aborted after the partial turn", len(calls) == 3, f"{len(calls)}")
 
 
 def test_run_session_hit_run_never_aborts():
@@ -639,6 +686,8 @@ def main():
     test_run_session_thinking_flag()
     test_run_session_aborts_on_main_miss()
     test_run_session_aborts_on_finalize_miss()
+    test_run_session_lower_threshold_tolerates_partial_reuse()
+    test_run_session_strict_threshold_aborts_on_partial_reuse()
     test_run_session_hit_run_never_aborts()
     test_run_session_skips_when_stop_already_set()
     test_run_session_shared_stop_halts_other_session()
