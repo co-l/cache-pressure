@@ -26,9 +26,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import cache_pressure.agent_sim as agent_sim
 from cache_pressure.agent_sim import (SYSTEM, LiveView, _bar, _fmt_record,
                                       build_session_plan, compute_reuse,
-                                      fmt_elapsed, fmt_ktok, fmt_tps,
-                                      render_frame, summarise, validate_sizes,
-                                      viz_enabled)
+                                      finalize_ttft_verdict, fmt_elapsed,
+                                      fmt_ktok, fmt_tps, render_frame,
+                                      summarise, validate_sizes, viz_enabled)
 from cache_pressure.core import make_body
 
 FAILURES = []
@@ -151,6 +151,106 @@ def test_summarise_excludes_aborted():
           out["subs_total"] == 0 and out["subs_cold"] == 0)
     check("completed finalize kept", out["finalize_total"] == 1 and
           out["finalize_ok"] == 1)
+
+
+def test_finalize_ttft_verdict():
+    def rec(sid, phase, step, ttft, aborted=False):
+        r = {"session": sid, "phase": phase, "step": step, "ttft": ttft}
+        if aborted:
+            r["aborted"] = True
+        return r
+
+    recs = []
+    # s0: clean 10s baseline, fast finalize -> 0.3x ok
+    recs.append(rec(0, "main", 0, 5.0))
+    for i in (1, 2, 3):
+        recs.append(rec(0, "main", i, 10.0))
+    recs.append(rec(0, "finalize", 0, 3.0))
+    # s1: spike in the middle, median must ignore it -> 2.5x fail at 2.0
+    recs.append(rec(1, "main", 0, 5.0))
+    for i, t in ((1, 10.0), (2, 40.0), (3, 10.0)):
+        recs.append(rec(1, "main", i, t))
+    recs.append(rec(1, "finalize", 0, 25.0))
+    # s2: late spike, median filters it -> 1.81x ok
+    recs.append(rec(2, "main", 0, 5.0))
+    for i, t in ((1, 16.0), (2, 46.0), (3, 16.0)):
+        recs.append(rec(2, "main", i, t))
+    recs.append(rec(2, "finalize", 0, 29.0))
+
+    out = finalize_ttft_verdict(recs, ratio=2.0)
+    check("s0 fast finalize passes", out[0]["ttft_ok"] is True
+          and out[0]["ttft_ratio"] == 0.3, str(out[0]))
+    check("s1 degraded finalize fails", out[1]["ttft_ok"] is False
+          and out[1]["ttft_ratio"] == 2.5, str(out[1]))
+    check("s2 median ignores the spike", out[2]["ttft_ok"] is True
+          and out[2]["baseline_ttft"] == 16.0
+          and out[2]["ttft_ratio"] == 29.0 / 16.0, str(out[2]))
+
+    check("median-of-3, not median-of-all",
+          finalize_ttft_verdict(
+              [rec(9, "main", 0, 5.0), rec(9, "main", 1, 10.0),
+               rec(9, "main", 2, 10.0), rec(9, "main", 3, 10.0),
+               rec(9, "main", 4, 45.0), rec(9, "main", 5, 45.0),
+               rec(9, "finalize", 0, 60.0)], ratio=2.0)[9]["ttft_ratio"] == 1.3333333333333333)
+
+    check("exact 2x is not a pass",
+          finalize_ttft_verdict(
+              [rec(8, "main", 0, 5.0), rec(8, "main", 1, 10.0),
+               rec(8, "main", 2, 10.0), rec(8, "finalize", 0, 20.0)],
+              ratio=2.0)[8]["ttft_ok"] is False)
+
+    check("custom ratio widens the gate",
+          finalize_ttft_verdict(recs, ratio=3.0)[1]["ttft_ok"] is True)
+
+    boundary = [rec(6, "main", 0, 5.0), rec(6, "main", 1, 10.0),
+                rec(6, "main", 2, 10.0), rec(6, "finalize", 0, 18.0)]
+    check("1.8x fails the 1.75 default",
+          finalize_ttft_verdict(boundary)[6]["ttft_ok"] is False)
+    check("1.8x passes the wider 2.0 gate",
+          finalize_ttft_verdict(boundary, ratio=2.0)[6]["ttft_ok"] is True)
+
+    unverified = finalize_ttft_verdict(
+        [rec(4, "main", 0, 5.0), rec(4, "finalize", 0, 3.0)], ratio=2.0)[4]
+    check("no main-continuation baseline -> unverified, never a silent pass",
+          unverified["baseline_ttft"] is None and unverified["ttft_ratio"] is None
+          and unverified["ttft_ok"] is False)
+
+    aborted = finalize_ttft_verdict(
+        [rec(5, "main", 0, 5.0), rec(5, "main", 1, 10.0),
+         rec(5, "main", 2, 10.0), rec(5, "main", 3, 999.0, aborted=True),
+         rec(5, "finalize", 0, 25.0)], ratio=2.0)[5]
+    check("aborted turns are excluded from the baseline",
+          aborted["ttft_ratio"] == 2.5 and aborted["ttft_ok"] is False,
+          str(aborted))
+
+
+def test_summarise_ttft_extension():
+    recs = []
+    for s in (0, 1):
+        recs.append(dict(_records(s, "main", 0, 5000, 0, 0.0), ttft=9.0))
+        for i, t in ((1, 10.0), (2, 10.0)):
+            recs.append(dict(_records(s, "main", i, 15000, 14800, 0.99), ttft=t))
+        recs.append(dict(_records(s, "sub", 0, 40000, 0, 0.0), ttft=50.0))
+        recs.append(dict(_records(s, "finalize", 0, 17000, 15000, 0.99),
+                         ttft=3.0 if s == 0 else 40.0))
+
+    out = summarise(recs, num_sessions=2, sub_windows=2, threshold=0.95)
+    check("legacy finalize gate unchanged",
+          out["finalize_ok"] == 2 and out["finalize_total"] == 2)
+    check("one degraded finalize flagged by ttft",
+          out["finalize_ttft_ok"] == 1 and out["finalize_ttft_verified"] == 2)
+    check("ttft pct reported", out["finalize_ttft_pct"] == 50.0)
+    check("per-session verdicts attached",
+          out["finalize_ttft"][0]["ttft_ok"] is True
+          and out["finalize_ttft"][1]["ttft_ratio"] == 4.0)
+
+    legacy = summarise([_records(0, "main", 1, 10000, 9000, 0.9),
+                        _records(0, "finalize", 0, 12000, 11000, 0.99)],
+                       num_sessions=1, sub_windows=2, threshold=0.66)
+    check("records without ttft stay unverified",
+          legacy["finalize_ttft_verified"] == 0
+          and legacy["finalize_ttft_ok"] == 0
+          and legacy["finalize_ttft_pct"] is None)
 
 
 def _hit(prompt=1000):
@@ -707,6 +807,8 @@ def main():
     test_chat_stream_aborts_pre_post()
     test_chat_stream_aborts_mid_stream()
     test_summarise_excludes_aborted()
+    test_finalize_ttft_verdict()
+    test_summarise_ttft_extension()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILURE(S): {FAILURES}")

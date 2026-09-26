@@ -139,7 +139,15 @@ uvx --from cache-pressure agent-sim --base-url http://my-server:8000/v1 \
 
 Key flags: `--sessions` (3), `--main-tokens` (150000), `--sub-tokens`
 (40000), `--sub-windows` (2), `--step-tokens` (5000), `--max-concurrency`
-(2), `--timeout` (1200), `--salt`.
+(2), `--timeout` (1200), `--salt`, `--ttft-ratio` (1.75).
+
+Finalize survival is checked two independent ways: the engine's reported
+cached-token reuse fraction (`--miss-threshold`) and the finalize TTFT —
+it must stay under `--ttft-ratio` times the session's own warm-main
+baseline (median of the last 3 main turns). Under contention an engine can
+claim a full cache hit while doing real prefill work; only the TTFT
+reveals that, so a run passes only when every session clears both gates.
+The summary prints the per-session base/finalize TTFT and ratio.
 
 While the sessions run, the tool paints a live progress view (one column
 per session, redrawn in place at 8 fps): the main-context bar grows with
@@ -286,3 +294,10 @@ groups, deduplicated blocks) packs denser, so the cache can physically hold
 more context than the budget implies. One fixed deployment retained ~147%
 of advertised capacity with zero evictions at 39K granularity; the
 pre-fix engine kept ~52-65%.
+
+In agent-sim, `FINALIZE TTFT` is the load-bearing gate. A healthy engine
+serves the back-to-main finalize a few times faster than its own warm-main
+baseline (ratio ~0.1-0.3x). Ratios around 2x mean the engine reported a
+cache hit but paid near-full prefill under concurrent pressure; ratios
+near 10x+ are plain cold re-prefills (the context was evicted while the
+sub-agents ran).

@@ -12,7 +12,11 @@ contention.
 The headline metric is finalize survival: after a session's sub-agents ran
 (and other sessions kept hammering the cache), is the ~main-tokens main
 context still served from cache? A healthy deployment answers yes for every
-session.
+session, checked two independent ways: the engine's reported cached-token
+reuse fraction (miss-threshold) and the finalize TTFT ratio against the
+session's own warm-main baseline (ttft-ratio) — under pressure an engine can
+claim a cache hit while doing real prefill work, and only the TTFT reveals
+that.
 
 Cached tokens are read from usage.prompt_tokens_details.cached_tokens (ninfer,
 standard vLLM), falling back to llama.cpp-compatible timings.cache_n, and
@@ -35,6 +39,7 @@ import json
 import math
 import shutil
 import signal
+import statistics
 import sys
 import threading
 import time
@@ -72,6 +77,37 @@ def compute_reuse(cached, prev_prompt):
     if not cached or not prev_prompt:
         return 0.0
     return cached / prev_prompt
+
+
+def finalize_ttft_verdict(records, ratio=1.75):
+    """Per-session finalize TTFT verdict against a warm-main baseline.
+
+    Baseline: median of the last 3 non-aborted main-continuation TTFTs (the
+    warm-prefill speed of this session's own context, engine speed included).
+    ok = finalize TTFT strictly below ratio x baseline. Sessions without a
+    usable baseline are unverified (ratio None, ok False) — never a silent
+    pass, since TTFT is the one signal the engine cannot fake.
+    """
+    base = {}
+    fin = {}
+    for r in records:
+        if r.get("aborted") or r.get("ttft") is None:
+            continue
+        sid = r["session"]
+        if r["phase"] == "main" and r["step"] > 0:
+            base.setdefault(sid, []).append((r["step"], r["ttft"]))
+        elif r["phase"] == "finalize":
+            fin[sid] = r["ttft"]
+    out = {}
+    for sid in set(base) | set(fin):
+        turns = [t for _, t in sorted(base.get(sid, []))][-3:]
+        baseline = statistics.median(turns) if turns else None
+        f = fin.get(sid)
+        ratio_ = (f / baseline) if (baseline and f is not None) else None
+        out[sid] = {"baseline_ttft": baseline, "finalize_ttft": f,
+                    "ttft_ratio": ratio_,
+                    "ttft_ok": ratio_ is not None and ratio_ < ratio}
+    return out
 
 
 def validate_sizes(main_size, sub_tokens, finalize_new, max_context):
@@ -636,11 +672,16 @@ class Viz:
 
 
 def summarise(records, num_sessions, sub_windows, threshold=0.66,
-              elapsed=None):
+              elapsed=None, ratio=1.75):
     """Headline metrics from the collected per-turn records.
 
     Turns aborted mid-flight (another session tripped the stop) are left out
     — they neither hit nor missed, so they would only skew the counts.
+
+    Two independent finalize gates: reuse (the engine's reported
+    cached_tokens fraction) and TTFT ratio (finalize ttft vs the warm-main
+    baseline) — engines can report a cache hit while doing real prefill
+    work under pressure, so both must pass.
     """
     mains = [r for r in records if r["phase"] == "main" and r["step"] > 0
              and not r.get("aborted")]
@@ -651,6 +692,10 @@ def summarise(records, num_sessions, sub_windows, threshold=0.66,
     finalize_ok = sum(1 for r in finals if r["reuse"] >= threshold)
     subs_cold = sum(1 for r in subs
                     if not r["cached"] or r["cached"] <= 0.05 * (r["prompt"] or 0))
+    verdict = finalize_ttft_verdict(records, ratio=ratio)
+    ttft_ok = sum(1 for v in verdict.values() if v["ttft_ok"])
+    ttft_verified = sum(1 for v in verdict.values()
+                        if v["ttft_ratio"] is not None)
     return {
         "main_reused": main_reused,
         "main_total": len(mains),
@@ -662,6 +707,11 @@ def summarise(records, num_sessions, sub_windows, threshold=0.66,
         "finalize_survival_pct": (100.0 * finalize_ok / len(finals))
         if finals else None,
         "subs_cold_pct": (100.0 * subs_cold / len(subs)) if subs else None,
+        "finalize_ttft_ok": ttft_ok,
+        "finalize_ttft_verified": ttft_verified,
+        "finalize_ttft_pct": (100.0 * ttft_ok / ttft_verified)
+        if ttft_verified else None,
+        "finalize_ttft": verdict,
         "elapsed": elapsed,
     }
 
@@ -697,6 +747,10 @@ def main(argv=None):
     p.add_argument("--miss-threshold", type=float, default=0.66,
                    help="min reuse fraction a main/finalize turn must hit "
                         "to avoid aborting the run (default: 0.66)")
+    p.add_argument("--ttft-ratio", type=float, default=1.75,
+                   help="max finalize TTFT as a multiple of the session's "
+                        "warm-main baseline (median of last 3 main turns) "
+                        "for a pass (default: 1.75)")
     p.add_argument("--main-tokens", type=int, default=150000,
                    help="main-agent context size in tokens")
     p.add_argument("--sub-tokens", type=int, default=40000,
@@ -837,7 +891,8 @@ def main(argv=None):
         print(_fmt_record(r))
 
     summary = summarise(records, args.sessions, args.sub_windows,
-                        threshold=args.miss_threshold, elapsed=elapsed)
+                        threshold=args.miss_threshold, elapsed=elapsed,
+                        ratio=args.ttft_ratio)
     print("\n── summary ──")
     print(f"  run time: {fmt_elapsed(summary['elapsed'])}")
     print(f"  main continuation turns reused: "
@@ -846,6 +901,18 @@ def main(argv=None):
     print(f"  FINALIZE survival (main context back from cache after subs): "
           f"{summary['finalize_ok']}/{summary['finalize_total']} "
           f"({summary['finalize_survival_pct'] and f'{summary['finalize_survival_pct']:.0f}%' or 'n/a'})")
+    print(f"  FINALIZE TTFT (finalize < {args.ttft_ratio}x warm-main baseline): "
+          f"{summary['finalize_ttft_ok']}/{summary['finalize_ttft_verified']} verified"
+          + (f"  ({summary['finalize_ttft_pct']:.0f}%)"
+             if summary["finalize_ttft_pct"] is not None else ""))
+    for sid in sorted(summary["finalize_ttft"]):
+        v = summary["finalize_ttft"][sid]
+        verdict = ("OK" if v["ttft_ok"]
+                   else "n/a" if v["ttft_ratio"] is None else "DEGRADED")
+        ratio_txt = (f"{v['ttft_ratio']:.2f}x"
+                     if v["ttft_ratio"] is not None else "–")
+        print(f"    s{sid}  base {_fmt(v['baseline_ttft'])}  "
+              f"finalize {_fmt(v['finalize_ttft'])}  {ratio_txt}  {verdict}")
     print(f"  sub windows cold (sanity): "
           f"{summary['subs_cold']}/{summary['subs_total']} "
           f"({summary['subs_cold_pct'] and f'{summary['subs_cold_pct']:.0f}%' or 'n/a'})")
@@ -863,8 +930,10 @@ def main(argv=None):
 
     reported = any(r["cached_source"] != "none" for r in records)
     if reported:
-        ok = summary["finalize_ok"] == summary["finalize_total"] and \
-            summary["finalize_total"] > 0
+        ok = (summary["finalize_ok"] == summary["finalize_total"] and
+              summary["finalize_total"] > 0 and
+              summary["finalize_ttft_verified"] > 0 and
+              summary["finalize_ttft_ok"] == summary["finalize_ttft_verified"])
     elif metrics1 and ratio is not None:
         print("  engine does not report per-request cached tokens; "
               "verification falls back to the engine prefix-cache counters")
