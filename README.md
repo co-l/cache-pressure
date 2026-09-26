@@ -147,7 +147,9 @@ it must stay under `--ttft-ratio` times the session's own warm-main
 baseline (median of the last 3 main turns). Under contention an engine can
 claim a full cache hit while doing real prefill work; only the TTFT
 reveals that, so a run passes only when every session clears both gates.
-The summary prints the per-session base/finalize TTFT and ratio.
+The summary prints one verdict per session (ok / evicted / degraded) with
+the base and finalize TTFTs behind it — `FINALIZE survival: 3/3 OK` on a
+healthy run, culprits named by session on a bad one.
 
 While the sessions run, the tool paints a live progress view (one column
 per session, redrawn in place at 8 fps): the main-context bar grows with
@@ -295,9 +297,10 @@ more context than the budget implies. One fixed deployment retained ~147%
 of advertised capacity with zero evictions at 39K granularity; the
 pre-fix engine kept ~52-65%.
 
-In agent-sim, `FINALIZE TTFT` is the load-bearing gate. A healthy engine
-serves the back-to-main finalize a few times faster than its own warm-main
-baseline (ratio ~0.1-0.3x). Ratios around 2x mean the engine reported a
-cache hit but paid near-full prefill under concurrent pressure; ratios
-near 10x+ are plain cold re-prefills (the context was evicted while the
-sub-agents ran).
+In agent-sim, the `FINALIZE survival` headline is the load-bearing gate.
+A healthy engine serves the back-to-main finalize a few times faster than
+its own warm-main baseline (ratio ~0.1-0.3x). `degraded` means the engine
+reported a cache hit but paid near-full prefill under concurrent pressure
+(ratio at/above the `--ttft-ratio` gate); `evicted` means the context was
+dropped while the sub-agents ran — ratios near 10x+ are plain cold
+re-prefills of the main context.

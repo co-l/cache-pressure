@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cache-pressure"
-version = "0.6.2"
+version = "0.6.3"
 description = "KV-cache retention pressure benchmark for OpenAI-compatible endpoints"
 readme = "README.md"
 requires-python = ">=3.9"

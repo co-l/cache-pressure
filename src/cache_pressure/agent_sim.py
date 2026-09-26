@@ -90,24 +90,56 @@ def finalize_ttft_verdict(records, ratio=1.75):
     """
     base = {}
     fin = {}
+    fin_reuse = {}
+    fin_aborted = {}
     for r in records:
+        sid = r["session"]
+        if r["phase"] == "finalize":
+            fin_aborted[sid] = bool(r.get("aborted"))
+            if not r.get("aborted"):
+                fin_reuse[sid] = r.get("reuse")
         if r.get("aborted") or r.get("ttft") is None:
             continue
-        sid = r["session"]
         if r["phase"] == "main" and r["step"] > 0:
             base.setdefault(sid, []).append((r["step"], r["ttft"]))
         elif r["phase"] == "finalize":
             fin[sid] = r["ttft"]
     out = {}
-    for sid in set(base) | set(fin):
+    for sid in set(base) | set(fin) | set(fin_aborted):
         turns = [t for _, t in sorted(base.get(sid, []))][-3:]
         baseline = statistics.median(turns) if turns else None
         f = fin.get(sid)
         ratio_ = (f / baseline) if (baseline and f is not None) else None
         out[sid] = {"baseline_ttft": baseline, "finalize_ttft": f,
                     "ttft_ratio": ratio_,
-                    "ttft_ok": ratio_ is not None and ratio_ < ratio}
+                    "ttft_ok": ratio_ is not None and ratio_ < ratio,
+                    "reuse": fin_reuse.get(sid),
+                    "aborted": fin_aborted.get(sid, False)}
     return out
+
+
+def label_finalize(v, threshold, ratio):
+    """Verdict word for a session's finalize: ok | evicted | degraded
+    (| 'evicted, degraded') | unverified | aborted.
+
+    evicted: the engine reported the prefix as (mostly) uncached.
+    degraded: the engine reported a hit but the finalize TTFT exceeds the
+    warm-main baseline by the ratio factor — real prefill paid for a
+    claimed cache hit.
+    """
+    if v.get("aborted"):
+        return "aborted"
+    if v.get("reuse") is None or v.get("ttft_ratio") is None:
+        return "unverified"
+    evicted = v["reuse"] < threshold
+    degraded = v["ttft_ratio"] >= ratio
+    if evicted and degraded:
+        return "evicted, degraded"
+    if evicted:
+        return "evicted"
+    if degraded:
+        return "degraded"
+    return "ok"
 
 
 def validate_sizes(main_size, sub_tokens, finalize_new, max_context):
@@ -693,6 +725,8 @@ def summarise(records, num_sessions, sub_windows, threshold=0.66,
     subs_cold = sum(1 for r in subs
                     if not r["cached"] or r["cached"] <= 0.05 * (r["prompt"] or 0))
     verdict = finalize_ttft_verdict(records, ratio=ratio)
+    for v in verdict.values():
+        v["verdict"] = label_finalize(v, threshold, ratio)
     ttft_ok = sum(1 for v in verdict.values() if v["ttft_ok"])
     ttft_verified = sum(1 for v in verdict.values()
                         if v["ttft_ratio"] is not None)
@@ -733,6 +767,36 @@ def _fmt_record(r):
             f"reuse={r['reuse'] * 100:5.1f}%  "
             f"{reuse_class + '  ' if reuse_class else ''}"
             f"ttft={_fmt(r['ttft'])}  err={r['error'] or '–'}{aborted}")
+
+
+def format_finalize(summary, ratio):
+    """Render the finalize-survival block: one verdict headline, one line
+    per session — the sub coldness sanity check is deliberately not shown,
+    it only guards the test harness itself."""
+    # Aborted sessions are our own short-circuit (a miss in one session
+    # stops the others' pending turns) — not an engine finding, so they
+    # stay out of the verdict block.
+    per = {sid: v for sid, v in summary["finalize_ttft"].items()
+           if not v["aborted"]}
+    total = len(per)
+    ok = [sid for sid in per if per[sid]["verdict"] == "ok"]
+    if total == 0:
+        lines = ["  FINALIZE survival: 0/0 (no finalize completed)"]
+    elif len(ok) == total:
+        lines = [f"  FINALIZE survival: {total}/{total} OK"]
+    else:
+        fails = ", ".join(f"s{sid} {per[sid]['verdict']}"
+                          for sid in sorted(per)
+                          if per[sid]["verdict"] != "ok")
+        lines = [f"  FINALIZE survival: {len(ok)}/{total} — {fails}"]
+    for sid in sorted(per):
+        v = per[sid]
+        ratio_txt = (f"{v['ttft_ratio']:.2f}x"
+                     if v["ttft_ratio"] is not None else "–")
+        lines.append(f"    s{sid}  base {_fmt(v['baseline_ttft'])}  "
+                     f"finalize {_fmt(v['finalize_ttft'])}  {ratio_txt}  "
+                     f"{v['verdict'].upper()}")
+    return lines
 
 
 def main(argv=None):
@@ -898,24 +962,8 @@ def main(argv=None):
     print(f"  main continuation turns reused: "
           f"{summary['main_reused']}/{summary['main_total']} "
           f"({summary['main_reuse_pct'] and f'{summary['main_reuse_pct']:.0f}%' or 'n/a'})")
-    print(f"  FINALIZE survival (main context back from cache after subs): "
-          f"{summary['finalize_ok']}/{summary['finalize_total']} "
-          f"({summary['finalize_survival_pct'] and f'{summary['finalize_survival_pct']:.0f}%' or 'n/a'})")
-    print(f"  FINALIZE TTFT (finalize < {args.ttft_ratio}x warm-main baseline): "
-          f"{summary['finalize_ttft_ok']}/{summary['finalize_ttft_verified']} verified"
-          + (f"  ({summary['finalize_ttft_pct']:.0f}%)"
-             if summary["finalize_ttft_pct"] is not None else ""))
-    for sid in sorted(summary["finalize_ttft"]):
-        v = summary["finalize_ttft"][sid]
-        verdict = ("OK" if v["ttft_ok"]
-                   else "n/a" if v["ttft_ratio"] is None else "DEGRADED")
-        ratio_txt = (f"{v['ttft_ratio']:.2f}x"
-                     if v["ttft_ratio"] is not None else "–")
-        print(f"    s{sid}  base {_fmt(v['baseline_ttft'])}  "
-              f"finalize {_fmt(v['finalize_ttft'])}  {ratio_txt}  {verdict}")
-    print(f"  sub windows cold (sanity): "
-          f"{summary['subs_cold']}/{summary['subs_total']} "
-          f"({summary['subs_cold_pct'] and f'{summary['subs_cold_pct']:.0f}%' or 'n/a'})")
+    for line in format_finalize(summary, args.ttft_ratio):
+        print(line)
 
     if metrics0:
         metrics1 = read_prefix_cache_metrics(args.base_url, args.api_key,

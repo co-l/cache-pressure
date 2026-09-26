@@ -26,9 +26,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import cache_pressure.agent_sim as agent_sim
 from cache_pressure.agent_sim import (SYSTEM, LiveView, _bar, _fmt_record,
                                       build_session_plan, compute_reuse,
-                                      finalize_ttft_verdict, fmt_elapsed,
-                                      fmt_ktok, fmt_tps, render_frame,
-                                      summarise, validate_sizes, viz_enabled)
+                                      finalize_ttft_verdict, format_finalize,
+                                      fmt_elapsed, fmt_ktok, fmt_tps,
+                                      label_finalize, render_frame, summarise,
+                                      validate_sizes, viz_enabled)
 from cache_pressure.core import make_body
 
 FAILURES = []
@@ -222,6 +223,67 @@ def test_finalize_ttft_verdict():
     check("aborted turns are excluded from the baseline",
           aborted["ttft_ratio"] == 2.5 and aborted["ttft_ok"] is False,
           str(aborted))
+
+
+def test_label_finalize():
+    def v(reuse, ratio_, aborted=False):
+        return {"reuse": reuse, "ttft_ratio": ratio_, "aborted": aborted}
+    check("clean finalize is ok",
+          label_finalize(v(1.0, 0.3), 0.66, 1.75) == "ok")
+    check("reported miss is evicted",
+          label_finalize(v(0.0, 1.74), 0.66, 1.75) == "evicted")
+    check("slow hit is degraded",
+          label_finalize(v(1.0, 3.9), 0.66, 1.75) == "degraded")
+    check("both signals failing",
+          label_finalize(v(0.0, 3.9), 0.66, 1.75) == "evicted, degraded")
+    check("boundary ratio fails the strict gate",
+          label_finalize(v(1.0, 1.75), 0.66, 1.75) == "degraded")
+    check("just under the boundary is ok",
+          label_finalize(v(1.0, 1.74), 0.66, 1.75) == "ok")
+    check("no baseline is unverified",
+          label_finalize(v(None, None), 0.66, 1.75) == "unverified")
+    check("aborted wins", label_finalize(v(0.0, 1.74, True), 0.66, 1.75) == "aborted")
+
+
+def test_format_finalize():
+    def v(base, fin, ratio_, ok, verdict_, aborted=False):
+        return {"baseline_ttft": base, "finalize_ttft": fin,
+                "ttft_ratio": ratio_, "ttft_ok": ok,
+                "reuse": 0.0 if verdict_ != "ok" else 1.0,
+                "aborted": aborted, "verdict": verdict_}
+
+    good = {"finalize_ttft": {
+        0: v(12.6, 2.2, 0.17, True, "ok"),
+        1: v(12.4, 3.6, 0.29, True, "ok"),
+        2: v(10.5, 1.9, 0.18, True, "ok")}}
+    lines = format_finalize(good, 1.75)
+    check("all-ok headline", lines[0] == "  FINALIZE survival: 3/3 OK",
+          lines[0])
+    check("per-session line shows the numbers",
+          lines[1] == "    s0  base 12.60s  finalize 2.20s  0.17x  OK",
+          lines[1])
+
+    bad = {"finalize_ttft": {
+        0: v(18.56, None, None, False, "aborted", True),
+        1: v(18.86, None, None, False, "aborted", True),
+        2: v(21.64, 37.71, 1.74, True, "evicted")}}
+    lines = format_finalize(bad, 1.75)
+    check("failure headline counts completed finalizes only",
+          lines[0] == "  FINALIZE survival: 0/1 — s2 evicted", lines[0])
+    check("aborted sessions are not shown", len(lines) == 2)
+    check("evicted line keeps the numbers",
+          lines[1] == "    s2  base 21.64s  finalize 37.71s  1.74x  EVICTED",
+          lines[1])
+
+    lines = format_finalize({"finalize_ttft": {
+        0: v(None, None, None, False, "aborted", True),
+        1: v(None, None, None, False, "aborted", True)}}, 1.75)
+    check("all aborted", lines[0] ==
+          "  FINALIZE survival: 0/0 (no finalize completed)", lines[0])
+
+    lines = format_finalize({"finalize_ttft": {}}, 1.75)
+    check("no finals", lines[0] ==
+          "  FINALIZE survival: 0/0 (no finalize completed)", lines[0])
 
 
 def test_summarise_ttft_extension():
@@ -808,6 +870,8 @@ def main():
     test_chat_stream_aborts_mid_stream()
     test_summarise_excludes_aborted()
     test_finalize_ttft_verdict()
+    test_label_finalize()
+    test_format_finalize()
     test_summarise_ttft_extension()
     print()
     if FAILURES:
